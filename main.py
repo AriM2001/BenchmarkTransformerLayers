@@ -1,23 +1,19 @@
 #!/usr/bin/env python3
 """
-Minimal, extensible benchmark for Transformer attention + MLP on CPU / CUDA / MPS.
+Minimal, self-contained Transformer attention/MLP benchmark for CPU / CUDA / MPS.
+This is a drop-in working version for Windows (CUDA) or macOS (MPS) or CPU-only.
 
 Outputs:
-  - CSV with latency (p50/p95), achieved TFLOPs, and (where available) peak memory.
-  - One profiler trace per config (Chrome trace JSON) to inspect kernel/operator breakdowns.
+  - bench_results.csv with latency (p50/p95), FLOPs, achieved TFLOPs, and peak CUDA memory.
+  - traces/*.json Chrome traces from torch.profiler for each configuration.
 
-Usage examples:
-  python bench_transformer.py --devices cpu cuda mps \
-      --modes attention mlp block \
-      --batch-sizes 1 4 8 --seq-lens 128 512 2048 \
-      --num-heads 8 16 --head-dim 64 128 \
-      --dtype fp32 bf16 \
-      --sdpa-backend auto  # or: math flash efficient
+Example runs:
+  python main.py --devices cpu --modes attention mlp block --dtype fp32
+  python main.py --devices cuda --dtype fp32 bf16 --sdpa-backend flash
+  python main.py --devices mps  --dtype fp32 bf16
 
-Notes:
-  - CUDA: requires a PyTorch build with CUDA. MPS: requires macOS + Apple Silicon with MPS-enabled PyTorch.
-  - SDPA backends depend on your PyTorch version + device capabilities; the script will try to honor your choice and fall back gracefully.
-  - FLOPs are estimated analytically; if fvcore or thop are installed, they can be used instead with --flops-tool fvcore|thop.
+Optional libraries for FLOPs: fvcore, thop
+  pip install fvcore thop
 """
 
 import argparse
@@ -28,7 +24,7 @@ import os
 import sys
 import time
 from dataclasses import dataclass
-from typing import Dict, Tuple, List, Optional
+from typing import Optional, Tuple, List, Dict
 
 import torch
 import torch.nn as nn
@@ -39,7 +35,8 @@ from torch.utils.benchmark import Timer
 
 def set_seed(seed: int = 1234):
     torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 
 def device_ok(device: str) -> bool:
@@ -59,7 +56,7 @@ def synchronize(device: str):
         try:
             torch.mps.synchronize()
         except Exception:
-            pass  # best effort
+            pass
 
 
 def to_dtype(dtype_str: str):
@@ -95,7 +92,7 @@ class AttentionOnly(nn.Module):
         k = self.k_proj(x).view(B, S, H, Dh).transpose(1, 2)
         v = self.v_proj(x).view(B, S, H, Dh).transpose(1, 2)
 
-        # Select SDPA backend if CUDA is available; otherwise PyTorch will choose appropriate path
+        # Select SDPA backend if available; otherwise PyTorch will choose a fallback
         if attn_impl in {"math", "flash", "efficient"}:
             set_sdpa_backend(attn_impl)
         elif attn_impl == "auto":
@@ -136,18 +133,26 @@ class TransformerBlock(nn.Module):
 
 def set_sdpa_backend(backend: Optional[str]):
     """Try to switch SDPA backend when available. None resets to defaults."""
-    # Newer PyTorch exposes a context manager API; fall back to env flags if missing.
+    # Only defined for CUDA; guard attributes to avoid crashes on CPU-only builds
     try:
+        if not hasattr(torch.backends, 'cuda'):
+            return
         if backend is None:
             # Reset to default heuristics.
-            torch.backends.cuda.enable_flash_sdp(True)
-            torch.backends.cuda.enable_math_sdp(True)
-            torch.backends.cuda.enable_mem_efficient_sdp(True)
+            if hasattr(torch.backends.cuda, 'enable_flash_sdp'):
+                torch.backends.cuda.enable_flash_sdp(True)
+            if hasattr(torch.backends.cuda, 'enable_math_sdp'):
+                torch.backends.cuda.enable_math_sdp(True)
+            if hasattr(torch.backends.cuda, 'enable_mem_efficient_sdp'):
+                torch.backends.cuda.enable_mem_efficient_sdp(True)
             return
         backend = backend.lower()
-        torch.backends.cuda.enable_flash_sdp(backend == "flash")
-        torch.backends.cuda.enable_math_sdp(backend == "math")
-        torch.backends.cuda.enable_mem_efficient_sdp(backend == "efficient")
+        if hasattr(torch.backends.cuda, 'enable_flash_sdp'):
+            torch.backends.cuda.enable_flash_sdp(backend == "flash")
+        if hasattr(torch.backends.cuda, 'enable_math_sdp'):
+            torch.backends.cuda.enable_math_sdp(backend == "math")
+        if hasattr(torch.backends.cuda, 'enable_mem_efficient_sdp'):
+            torch.backends.cuda.enable_mem_efficient_sdp(backend == "efficient")
     except Exception:
         pass
 
@@ -197,19 +202,31 @@ def estimate_flops(mode: str, B: int, S: int, H: int, Dh: int, d_model: int, mlp
 # ---------------------- Benchmarking ----------------------
 
 def run_latency(model, inputs, device: str, mode: str, attn_impl: str, warmup: int, min_run_time: float) -> Tuple[float, float]:
+    """Manual timing loop to compute p50/p95; avoids relying on Measurement.stdev."""
     model.eval()
     fn = (lambda: model(inputs, attn_impl=attn_impl)) if mode != "mlp" and hasattr(model, 'forward') and 'attn_impl' in model.forward.__code__.co_varnames else (lambda: model(inputs))
 
     # Warmup
     for _ in range(warmup):
         _ = fn()
-    synchronize(device)
+        synchronize(device)
 
-    # Timed: use blocked_autorange for stable timing; it syncs CUDA, we handle MPS explicitly.
-    t = Timer(stmt="fn()", globals={'fn': fn})
-    m = t.blocked_autorange(min_run_time=min_run_time)
-    p50 = m.median * 1e3
-    p95 = m.median * 1e3 + 1.96 * m.stdev * 1e3  # rough, not exact p95; good enough for trending
+    # Manual timing loop for robust percentiles
+    # Choose iteration count based on min_run_time (roughly ~50 iters/sec) but at least 20
+    iters = max(20, int(min_run_time * 50))
+    samples_ms: List[float] = []
+
+    for _ in range(iters):
+        t0 = time.perf_counter()
+        _ = fn()
+        synchronize(device)
+        t1 = time.perf_counter()
+        samples_ms.append((t1 - t0) * 1e3)
+
+    samples_ms.sort()
+    n = len(samples_ms)
+    p50 = samples_ms[n // 2]
+    p95 = samples_ms[int(0.95 * (n - 1))]
     return p50, p95
 
 
@@ -224,7 +241,6 @@ def profile_once(model, inputs, device: str, trace_path: str, mode: str, attn_im
         profile_memory=True,
         with_stack=False,
     ) as prof:
-        # one forward pass
         if mode != "mlp":
             _ = model(inputs, attn_impl=attn_impl)
         else:
@@ -242,7 +258,6 @@ def get_peak_mem_mb(device: str) -> Optional[float]:
         peak = torch.cuda.max_memory_allocated()
         torch.cuda.reset_peak_memory_stats()
         return peak / (1024 ** 2)
-    # MPS doesn't expose peak alloc easily; return None
     return None
 
 
@@ -335,7 +350,6 @@ def main():
                                 # Correctness sanity vs fp32 CPU (small shape only)
                                 if (B, S) == (1, 16):
                                     with torch.no_grad():
-                                        ref = None
                                         try:
                                             module_cpu = module.to('cpu', dtype=torch.float32)
                                             x_cpu = x.to('cpu', dtype=torch.float32)
@@ -365,8 +379,7 @@ def main():
 
                                 if args.flops_tool == 'fvcore' and fvcore_get_flops is not None:
                                     try:
-                                        inputs = (x,) if mode == 'mlp' else (x,)
-                                        # fvcore operates on callables / modules
+                                        inputs = (x,)
                                         from fvcore.nn import FlopCountAnalysis
                                         fca = FlopCountAnalysis(module, inputs)
                                         total_flops = float(fca.total())
@@ -386,7 +399,7 @@ def main():
                                 # Memory
                                 peak_mem_mb = get_peak_mem_mb(device)
 
-                                # Profile once per config (quick)
+                                # Profile once per config
                                 trace_name = f"trace_{device}_{mode}_{dtype_str}_B{B}_S{S}_H{H}_Dh{Dh}.json".replace('/', '-')
                                 trace_path = os.path.join(args.trace_dir, trace_name)
                                 try:
