@@ -1,29 +1,48 @@
 # BenchmarkTransformerLayers
-Goal: Benchmark attention/MLP layers on CPU, GPU, and Apple M-series.  Deliverable: Latency, FLOPs utilization, memory bottlenecks.  Grading: Benchmark correctness (30%), Comparison depth (40%), Report (30%).  Reference: pytorch/examplesLinks to an external site.
-
+This script benchmarks, profiles, and analyzes the performance of a machine translation model from Hugging Face Transformers — specifically designed to measure latency, throughput, FLOPs, and GPU memory usage during inference.
 
 1. Create a fresh env and install deps:
 
-pip install torch --upgrade
-# Optional FLOPs helpers:
-pip install fvcore thop
+pip install torch torchvision torchaudio
+pip install transformers datasets
 
+2. Configuration:
 
-2. Run a small sweep on whatever you have:
+| Variable         | Description                    | Default                        |
+| ---------------- | ------------------------------ | ------------------------------ |
+| `MODEL_NAME`     | Hugging Face model to use      | `"Helsinki-NLP/opus-mt-en-es"` |
+| `DATASET`        | Dataset name and language pair | `("opus_books", "en-es")`      |
+| `SPLIT`          | Dataset subset for testing     | `"train[:100]"`                |
+| `BATCH_SIZE`     | Number of samples per batch    | `32`                           |
+| `MAX_NEW_TOKENS` | Max tokens to generate         | `96`                           |
+| `NUM_BEAMS`      | Beam width for decoding        | `4`                            |
+| `USE_MIXED_PREC` | Enable mixed precision on GPU  | `True`                         |
 
-python bench_transformer.py --devices cpu \
-  --modes attention mlp block \
-  --batch-sizes 1 4 --seq-lens 128 1024 \
-  --num-heads 8 --head-dim 64 \
-  --dtype fp32 bf16 \
-  --sdpa-backend auto \
-  --cpu-threads 8
+3. Usage:
 
+Run the script directly: python main.py
 
-3. If you have a GPU or Apple Silicon:
+It will:
 
-# NVIDIA
-python bench_transformer.py --devices cuda --dtype fp32 bf16 --sdpa-backend flash
+Load the dataset and translation model.
+Print device and precision info.
+Perform latency, FLOPs, and memory measurements.
+Display top operations from the PyTorch profiler.
 
-# Apple Silicon (M-series)
-python bench_transformer.py --devices mps --dtype fp32 bf16
+Example:
+
+Device: cuda  |  Mixed precision: torch.bfloat16
+
+=== Latency (one batch) ===
+Batch size: 32 | num_beams=4 | max_new_tokens=96
+mean: 0.2481s | p50: 0.2440s | p95: 0.2560s
+Throughput (approx gen tokens/sec): 1432.7
+
+=== FLOPs & Throughput ===
+Estimated total FLOPs (this batch): 0.521 TFLOPs
+Achieved throughput: 2.18 TFLOP/s
+
+=== Memory ===
+Peak allocated: 1842.5 MiB
+Peak reserved : 2050.3 MiB
+Device total  : 24576 MiB
