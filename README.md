@@ -5,6 +5,8 @@ This script benchmarks, profiles, and analyzes the performance of a machine tran
 
 pip install torch torchvision torchaudio
 pip install transformers datasets
+pip install sentencepiece
+pip install sacremoses
 
 2. Configuration:
 
